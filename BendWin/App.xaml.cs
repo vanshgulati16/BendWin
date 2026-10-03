@@ -2,6 +2,7 @@ using System.Threading;
 using System.Windows;
 using BendWin.Core;
 using BendWin.UI;
+using Application = System.Windows.Application;
 
 namespace BendWin;
 

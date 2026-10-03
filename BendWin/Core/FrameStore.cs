@@ -4,9 +4,9 @@ using Vortice.Direct3D11;
 namespace BendWin.Core;
 
 // Thread-safe single-slot frame buffer. The capture thread writes; the render thread reads.
-internal sealed class FrameStore : IDisposable
+public sealed class FrameStore : IDisposable
 {
-    private readonly Lock _lock = new();
+    private readonly object _lock = new();
     private ID3D11Texture2D? _texture;
     private long _timestamp;
 

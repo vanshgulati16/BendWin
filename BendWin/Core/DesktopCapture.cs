@@ -97,15 +97,16 @@ public sealed class DesktopCapture : IDisposable
 
     // ── WinRT interop ─────────────────────────────────────────────────────────
 
-    [DllImport("d3d11.dll", EntryPoint = "CreateDirect3D11DeviceFromDXGIDevice", PreserveSig = false)]
-    private static extern void NativeCreateDirect3D11DeviceFromDXGIDevice(
-        [MarshalAs(UnmanagedType.IUnknown)] object dxgiDevice,
+    [DllImport("d3d11.dll", EntryPoint = "CreateDirect3D11DeviceFromDXGIDevice", PreserveSig = true)]
+    private static extern int NativeCreateDirect3D11DeviceFromDXGIDevice(
+        IntPtr dxgiDevice,
         out IntPtr graphicsDevice);
 
     private static IDirect3DDevice CreateWinRTDevice(ID3D11Device d3d11)
     {
-        var dxgi = d3d11.QueryInterface<IDXGIDevice>();
-        NativeCreateDirect3D11DeviceFromDXGIDevice(dxgi, out var ptr);
+        using var dxgi = d3d11.QueryInterface<IDXGIDevice>();
+        int hr = NativeCreateDirect3D11DeviceFromDXGIDevice(dxgi.NativePointer, out var ptr);
+        Marshal.ThrowExceptionForHR(hr);
         var dev = WinRT.MarshalInterface<IDirect3DDevice>.FromAbi(ptr);
         Marshal.Release(ptr);
         return dev;

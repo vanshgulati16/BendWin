@@ -44,7 +44,12 @@ float2 FoldUV(float2 uv)
 
     // Map from tapered space back to original [0,1] x [0,1]
     float src_x = (uv.x - inset) / max(1.0f - 2.0f * inset, 0.0001f);
-    float src_y = uv.y;
+
+    // Vertical foreshortening: top recedes as lid closes (perspective)
+    float foreshorten = 1.0f + p * persp * h * 0.6f;
+    float src_y = 1.0f - (1.0f - uv.y) * foreshorten;
+    if (src_y < 0.0f || src_y > 1.0f)
+        return float2(-1.0f, -1.0f);
 
     return float2(src_x, src_y);
 }

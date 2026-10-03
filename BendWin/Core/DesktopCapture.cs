@@ -22,6 +22,7 @@ public sealed class DesktopCapture : IDisposable
     private GraphicsCaptureSession? _session;
     private IDirect3DDevice? _winrtDevice;
     private bool _disposed;
+    private int _frameErrorCount;
 
     public bool IsRunning { get; private set; }
     public SizeInt32 CaptureSize { get; private set; }
@@ -65,6 +66,8 @@ public sealed class DesktopCapture : IDisposable
         _pool = null;
     }
 
+    private static readonly Guid _iidDxgiAccess = new("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1");
+
     private void OnFrameArrived(Direct3D11CaptureFramePool sender, object args)
     {
         using var frame = sender.TryGetNextFrame();
@@ -72,28 +75,50 @@ public sealed class DesktopCapture : IDisposable
 
         try
         {
-            // Unwrap WinRT surface → D3D11 texture via IDxgiInterfaceAccess
-            var surfacePtr = Marshal.GetIUnknownForObject(frame.Surface);
-            var access = (IDxgiInterfaceAccess)Marshal.GetObjectForIUnknown(surfacePtr);
-            Marshal.Release(surfacePtr);
-            Guid tex2dGuid = typeof(ID3D11Texture2D).GUID;
-            access.GetInterface(ref tex2dGuid, out var texPtr);
-            using var srcTexture = new ID3D11Texture2D(texPtr);
+            // Get the native ABI pointer for the IDirect3DSurface WinRT object
+            var surfaceAbi = WinRT.MarshalInterface<Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface>
+                                  .ToAbi(frame.Surface);
+            if (surfaceAbi == IntPtr.Zero) return;
 
-            var desc = srcTexture.Description;
-            desc.BindFlags = BindFlags.ShaderResource;
-            desc.MiscFlags = ResourceOptionFlags.None;
-            desc.Usage = ResourceUsage.Default;
-            desc.CPUAccessFlags = CpuAccessFlags.None;
+            try
+            {
+                // Direct COM QI for IDirect3DDxgiInterfaceAccess — avoids RCW issues
+                var iid = _iidDxgiAccess;
+                int hr = Marshal.QueryInterface(surfaceAbi, ref iid, out var accessPtr);
+                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
 
-            var copy = _device.CreateTexture2D(desc);
-            lock (_context) { _context.CopyResource(copy, srcTexture); }
+                try
+                {
+                    var access = (IDxgiInterfaceAccess)Marshal.GetObjectForIUnknown(accessPtr);
+                    Guid tex2dGuid = typeof(ID3D11Texture2D).GUID;
+                    access.GetInterface(ref tex2dGuid, out var texPtr);
+                    using var srcTexture = new ID3D11Texture2D(texPtr);
 
-            _store.Set(copy, DateTime.UtcNow.Ticks);
+                    var desc = srcTexture.Description;
+                    desc.BindFlags = BindFlags.ShaderResource;
+                    desc.MiscFlags = ResourceOptionFlags.None;
+                    desc.Usage = ResourceUsage.Default;
+                    desc.CPUAccessFlags = CpuAccessFlags.None;
+
+                    var copy = _device.CreateTexture2D(desc);
+                    lock (_context) { _context.CopyResource(copy, srcTexture); }
+                    _store.Set(copy, DateTime.UtcNow.Ticks);
+                }
+                finally { Marshal.Release(accessPtr); }
+            }
+            finally { Marshal.Release(surfaceAbi); }
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[BendWin] FrameArrived error: {ex}");
+            if (System.Threading.Interlocked.Increment(ref _frameErrorCount) == 1)
+            {
+                System.Windows.Application.Current?.Dispatcher.InvokeAsync(() =>
+                    System.Windows.MessageBox.Show(
+                        $"Frame processing error (first occurrence):\n\n{ex.GetType().Name}: {ex.Message}\n\n{ex.StackTrace}",
+                        "BendWin — Frame Error",
+                        System.Windows.MessageBoxButton.OK,
+                        System.Windows.MessageBoxImage.Error));
+            }
         }
     }
 

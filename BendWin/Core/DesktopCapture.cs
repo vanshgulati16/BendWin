@@ -132,11 +132,15 @@ public sealed class DesktopCapture : IDisposable
         [PreserveSig] int CreateForMonitor(IntPtr monitor, ref Guid iid, out IntPtr item);
     }
 
-    [DllImport("combase.dll")]
-    private static extern int RoGetActivationFactory(
-        [MarshalAs(UnmanagedType.HString)] string classId,
-        ref Guid iid,
-        out IntPtr factory);
+    [DllImport("combase.dll", PreserveSig = true)]
+    private static extern int RoGetActivationFactory(IntPtr classId, ref Guid iid, out IntPtr factory);
+
+    [DllImport("combase.dll", PreserveSig = true)]
+    private static extern int WindowsCreateString(
+        [MarshalAs(UnmanagedType.LPWStr)] string str, int length, out IntPtr hstring);
+
+    [DllImport("combase.dll", PreserveSig = true)]
+    private static extern int WindowsDeleteString(IntPtr hstring);
 
     private static GraphicsCaptureItem CreateCaptureItemForPrimaryMonitor()
     {
@@ -147,28 +151,36 @@ public sealed class DesktopCapture : IDisposable
         if (hMonitor == IntPtr.Zero)
             throw new Exception("MonitorFromPoint returned null — no primary monitor found.");
 
+        const string classId = "Windows.Graphics.Capture.GraphicsCaptureItem";
+        int hstrHr = WindowsCreateString(classId, classId.Length, out var hstr);
+        if (hstrHr < 0) Marshal.ThrowExceptionForHR(hstrHr);
+
         Guid interopIID = new("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356");
-        int hr = RoGetActivationFactory(
-            "Windows.Graphics.Capture.GraphicsCaptureItem",
-            ref interopIID,
-            out var factoryPtr);
+        int hr;
+        try
+        {
+            hr = RoGetActivationFactory(hstr, ref interopIID, out var factoryPtr);
 
-        if (hr < 0)
-            Marshal.ThrowExceptionForHR(hr); // surfaces real HRESULT
+            if (hr < 0)
+                Marshal.ThrowExceptionForHR(hr);
 
-        var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
-        Marshal.Release(factoryPtr);
+            var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
+            Marshal.Release(factoryPtr);
 
-        // Use IInspectable IID so we get back an IInspectable* we can wrap
-        Guid inspectableIID = new("AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90");
-        hr = interop.CreateForMonitor(hMonitor, ref inspectableIID, out var itemPtr);
+            Guid inspectableIID = new("AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90");
+            hr = interop.CreateForMonitor(hMonitor, ref inspectableIID, out var itemPtr);
 
-        if (hr < 0)
-            Marshal.ThrowExceptionForHR(hr);
+            if (hr < 0)
+                Marshal.ThrowExceptionForHR(hr);
 
-        var item = WinRT.MarshalInspectable<GraphicsCaptureItem>.FromAbi(itemPtr);
-        Marshal.Release(itemPtr);
-        return item;
+            var item = WinRT.MarshalInspectable<GraphicsCaptureItem>.FromAbi(itemPtr);
+            Marshal.Release(itemPtr);
+            return item;
+        }
+        finally
+        {
+            WindowsDeleteString(hstr);
+        }
     }
 
     public void Dispose()

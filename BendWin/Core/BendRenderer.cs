@@ -35,7 +35,6 @@ public sealed class BendRenderer : IDisposable
     private ID3D11RasterizerState?    _rasterState;
 
     private int   _width, _height;
-    private float _lastBlurParam = -1f;
     private long  _lastFrameTs;
     private bool  _disposed;
 
@@ -105,18 +104,8 @@ public sealed class BendRenderer : IDisposable
         lock (_paramLock) { p = _params; }
         if (p.Progress < 0.005f) return null;
 
-        using var srcSRV = Device.CreateShaderResourceView(srcTex);
-
-        bool needsBlur = Math.Abs(p.Blur - _lastBlurParam) > 0.01f;
-        if (needsBlur || _blurSRV[0] == null)
-        {
-            _lastBlurParam = p.Blur;
-            RunBlurPipeline(srcTex, p.Blur);
-        }
-        else
-        {
-            Context.CopyResource(_blurTex[0]!, srcTex);
-        }
+        // Re-blur the current frame every draw so the blur is always live.
+        RunBlurPipeline(srcTex, p.Blur);
 
         UpdateBendCB(p);
         RunBendPass();

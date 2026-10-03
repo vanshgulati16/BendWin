@@ -75,38 +75,33 @@ public sealed class DesktopCapture : IDisposable
 
         try
         {
-            // Get the native ABI pointer for the IDirect3DSurface WinRT object
-            var surfaceAbi = WinRT.MarshalInterface<Windows.Graphics.DirectX.Direct3D11.IDirect3DSurface>
-                                  .ToAbi(frame.Surface);
-            if (surfaceAbi == IntPtr.Zero) return;
+            // Get the raw native pointer via IWinRTObject (C#/WinRT 2.x API)
+            var winrtObj = (WinRT.IWinRTObject)frame.Surface;
+            var surfaceAbi = winrtObj.NativeObject.ThisPtr;
+
+            // Direct COM QI for IDirect3DDxgiInterfaceAccess — avoids RCW issues
+            var iid = _iidDxgiAccess;
+            int hr = Marshal.QueryInterface(surfaceAbi, ref iid, out var accessPtr);
+            if (hr < 0) Marshal.ThrowExceptionForHR(hr);
 
             try
             {
-                // Direct COM QI for IDirect3DDxgiInterfaceAccess — avoids RCW issues
-                var iid = _iidDxgiAccess;
-                int hr = Marshal.QueryInterface(surfaceAbi, ref iid, out var accessPtr);
-                if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+                var access = (IDxgiInterfaceAccess)Marshal.GetObjectForIUnknown(accessPtr);
+                Guid tex2dGuid = typeof(ID3D11Texture2D).GUID;
+                access.GetInterface(ref tex2dGuid, out var texPtr);
+                using var srcTexture = new ID3D11Texture2D(texPtr);
 
-                try
-                {
-                    var access = (IDxgiInterfaceAccess)Marshal.GetObjectForIUnknown(accessPtr);
-                    Guid tex2dGuid = typeof(ID3D11Texture2D).GUID;
-                    access.GetInterface(ref tex2dGuid, out var texPtr);
-                    using var srcTexture = new ID3D11Texture2D(texPtr);
+                var desc = srcTexture.Description;
+                desc.BindFlags = BindFlags.ShaderResource;
+                desc.MiscFlags = ResourceOptionFlags.None;
+                desc.Usage = ResourceUsage.Default;
+                desc.CPUAccessFlags = CpuAccessFlags.None;
 
-                    var desc = srcTexture.Description;
-                    desc.BindFlags = BindFlags.ShaderResource;
-                    desc.MiscFlags = ResourceOptionFlags.None;
-                    desc.Usage = ResourceUsage.Default;
-                    desc.CPUAccessFlags = CpuAccessFlags.None;
-
-                    var copy = _device.CreateTexture2D(desc);
-                    lock (_context) { _context.CopyResource(copy, srcTexture); }
-                    _store.Set(copy, DateTime.UtcNow.Ticks);
-                }
-                finally { Marshal.Release(accessPtr); }
+                var copy = _device.CreateTexture2D(desc);
+                lock (_context) { _context.CopyResource(copy, srcTexture); }
+                _store.Set(copy, DateTime.UtcNow.Ticks);
             }
-            finally { Marshal.Release(surfaceAbi); }
+            finally { Marshal.Release(accessPtr); }
         }
         catch (Exception ex)
         {

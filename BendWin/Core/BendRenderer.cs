@@ -29,6 +29,7 @@ public sealed class BendRenderer : IDisposable
     private readonly ID3D11ShaderResourceView?[] _blurSRV  = new ID3D11ShaderResourceView[7];
 
     private ID3D11RenderTargetView?   _outputRTV;
+    private ID3D11Texture2D?          _outputTex;
     private ID3D11Texture2D?          _readbackTex;
     private ID3D11SamplerState?       _sampler;
     private ID3D11RasterizerState?    _rasterState;
@@ -62,7 +63,7 @@ public sealed class BendRenderer : IDisposable
         D3D11.D3D11CreateDevice(
             adapter: null,
             driverType: DriverType.Hardware,
-            flags: DeviceCreationFlags.None,
+            flags: DeviceCreationFlags.BgraSupport,
             featureLevels: new[] { FeatureLevel.Level_11_0, FeatureLevel.Level_10_1 },
             device: out ID3D11Device device,
             immediateContext: out ID3D11DeviceContext context);
@@ -186,7 +187,7 @@ public sealed class BendRenderer : IDisposable
 
     private unsafe byte[] ReadbackPixels()
     {
-        Context.CopyResource(_readbackTex!, (ID3D11Resource)_outputRTV!.Resource!);
+        Context.CopyResource(_readbackTex!, _outputTex!);
         var mapped = Context.Map(_readbackTex!, 0, MapMode.Read, D3D11MapFlags.None);
         int stride = _width * 4;
         var buf = new byte[_height * stride];
@@ -283,8 +284,8 @@ public sealed class BendRenderer : IDisposable
             Usage = ResourceUsage.Default,
             BindFlags = BindFlags.RenderTarget | BindFlags.ShaderResource,
         };
-        var outTex = Device.CreateTexture2D(desc);
-        _outputRTV = Device.CreateRenderTargetView(outTex);
+        _outputTex = Device.CreateTexture2D(desc);
+        _outputRTV = Device.CreateRenderTargetView(_outputTex);
 
         _readbackTex = Device.CreateTexture2D(desc with
         {
@@ -341,7 +342,7 @@ public sealed class BendRenderer : IDisposable
         if (_disposed) return;
         _disposed = true;
         for (int i = 0; i < 7; i++) { _blurTex[i]?.Dispose(); _blurRTV[i]?.Dispose(); _blurSRV[i]?.Dispose(); }
-        _outputRTV?.Dispose(); _readbackTex?.Dispose();
+        _outputRTV?.Dispose(); _outputTex?.Dispose(); _readbackTex?.Dispose();
         _vsMain?.Dispose(); _psGaussH?.Dispose(); _psGaussV?.Dispose(); _psBend?.Dispose();
         _cbBend?.Dispose(); _cbBlur?.Dispose();
         _sampler?.Dispose(); _rasterState?.Dispose();

@@ -38,8 +38,7 @@ public sealed class DesktopCapture : IDisposable
         if (IsRunning) return;
 
         _winrtDevice = CreateWinRTDevice(_device);
-        _item = CreateCaptureItemForPrimaryMonitor();
-        if (_item == null) throw new InvalidOperationException("Cannot create capture item for primary monitor.");
+        _item = CreateCaptureItemForPrimaryMonitor(); // throws with detail on failure
 
         CaptureSize = _item.Size;
 
@@ -139,33 +138,37 @@ public sealed class DesktopCapture : IDisposable
         ref Guid iid,
         out IntPtr factory);
 
-    private static GraphicsCaptureItem? CreateCaptureItemForPrimaryMonitor()
+    private static GraphicsCaptureItem CreateCaptureItemForPrimaryMonitor()
     {
-        try
-        {
-            var hMonitor = PowerNative.MonitorFromPoint(
-                new PowerNative.POINT { X = 0, Y = 0 },
-                PowerNative.MONITOR_DEFAULTTOPRIMARY);
+        var hMonitor = PowerNative.MonitorFromPoint(
+            new PowerNative.POINT { X = 0, Y = 0 },
+            PowerNative.MONITOR_DEFAULTTOPRIMARY);
 
-            Guid interopIID = new("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356");
-            int hr = RoGetActivationFactory(
-                "Windows.Graphics.Capture.GraphicsCaptureItem",
-                ref interopIID,
-                out var factoryPtr);
-            if (hr < 0) return null;
+        if (hMonitor == IntPtr.Zero)
+            throw new Exception("MonitorFromPoint returned null — no primary monitor found.");
 
-            var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
-            Marshal.Release(factoryPtr);
+        Guid interopIID = new("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356");
+        int hr = RoGetActivationFactory(
+            "Windows.Graphics.Capture.GraphicsCaptureItem",
+            ref interopIID,
+            out var factoryPtr);
 
-            Guid itemIID = IID_IGraphicsCaptureItem;
-            hr = interop.CreateForMonitor(hMonitor, ref itemIID, out var itemPtr);
-            if (hr < 0) return null;
+        if (hr < 0)
+            Marshal.ThrowExceptionForHR(hr); // surfaces real HRESULT
 
-            var item = WinRT.MarshalInterface<GraphicsCaptureItem>.FromAbi(itemPtr);
-            Marshal.Release(itemPtr);
-            return item;
-        }
-        catch { return null; }
+        var interop = (IGraphicsCaptureItemInterop)Marshal.GetObjectForIUnknown(factoryPtr);
+        Marshal.Release(factoryPtr);
+
+        // Use IInspectable IID so we get back an IInspectable* we can wrap
+        Guid inspectableIID = new("AF86E2E0-B12D-4C6A-9C5A-D7AA65101E90");
+        hr = interop.CreateForMonitor(hMonitor, ref inspectableIID, out var itemPtr);
+
+        if (hr < 0)
+            Marshal.ThrowExceptionForHR(hr);
+
+        var item = WinRT.MarshalInspectable<GraphicsCaptureItem>.FromAbi(itemPtr);
+        Marshal.Release(itemPtr);
+        return item;
     }
 
     public void Dispose()

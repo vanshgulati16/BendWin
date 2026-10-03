@@ -207,38 +207,43 @@ public sealed class BendRenderer : IDisposable
         _psBend   = CompilePS(Path.Combine(dir, "BendPixel.hlsl"));
     }
 
-    private unsafe ID3D11VertexShader CompileVS(string path)
+    private ID3D11VertexShader CompileVS(string path)
     {
         Compiler.Compile(File.ReadAllText(path), null, null, "main",
             Path.GetFileName(path), "vs_5_0", 0, 0, out var blob, out var err);
         if (blob == null)
-            throw new Exception($"VS compile '{path}': {BlobString(err)}");
-        return Device.CreateVertexShader(BlobBytes(blob));
+            throw new Exception($"VS compile '{path}': {BlobToString(err)}");
+        var bytes = BlobToBytes(blob);
+        blob.Dispose(); err?.Dispose();
+        return Device.CreateVertexShader(bytes);
     }
 
-    private unsafe ID3D11PixelShader CompilePS(string path)
+    private ID3D11PixelShader CompilePS(string path)
     {
         Compiler.Compile(File.ReadAllText(path), null, null, "main",
             Path.GetFileName(path), "ps_5_0", 0, 0, out var blob, out var err);
         if (blob == null)
-            throw new Exception($"PS compile '{path}': {BlobString(err)}");
-        return Device.CreatePixelShader(BlobBytes(blob));
+            throw new Exception($"PS compile '{path}': {BlobToString(err)}");
+        var bytes = BlobToBytes(blob);
+        blob.Dispose(); err?.Dispose();
+        return Device.CreatePixelShader(bytes);
     }
 
-    private static unsafe byte[] BlobBytes(Vortice.D3DCompiler.Blob blob)
+    // Use dynamic so we don't need to name the exact Blob type (varies across Vortice versions).
+    private static byte[] BlobToBytes(dynamic blob)
     {
-        var size = (int)blob.BufferSize;
+        int size = (int)blob.BufferSize;
         var buf  = new byte[size];
-        Marshal.Copy(blob.BufferPointer, buf, 0, size);
+        Marshal.Copy((IntPtr)blob.BufferPointer, buf, 0, size);
         return buf;
     }
 
-    private static unsafe string BlobString(Vortice.D3DCompiler.Blob? blob)
+    private static string BlobToString(dynamic? blob)
     {
         if (blob == null) return "(no error blob)";
-        var size = (int)blob.BufferSize;
+        int size = (int)blob.BufferSize;
         var buf  = new byte[size];
-        Marshal.Copy(blob.BufferPointer, buf, 0, size);
+        Marshal.Copy((IntPtr)blob.BufferPointer, buf, 0, size);
         return Encoding.UTF8.GetString(buf);
     }
 

@@ -166,6 +166,7 @@ public partial class SettingsWindow : Window
 
     private void OnPreviewAngleChanged(object s, RoutedPropertyChangedEventArgs<double> e)
     {
+        if (_loading || LblPreviewAngle == null) return;
         LblPreviewAngle.Text = $"{(int)SliderPreview.Value}°";
         if (!_model.FollowLid)
         {

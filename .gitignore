@@ -1,0 +1,29 @@
+## Visual Studio / .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.rsuser
+*.DotSettings.user
+
+## NuGet
+packages/
+*.nupkg
+*.snupkg
+.nuget/
+project.lock.json
+
+## Rider / JetBrains
+.idea/
+*.sln.iml
+
+## OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+## Build artifacts
+publish/
+*.zip
+*.7z

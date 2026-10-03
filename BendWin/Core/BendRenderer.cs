@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 using Vortice.D3DCompiler;
 using Vortice.Direct3D;
 using Vortice.Direct3D11;
@@ -7,8 +8,6 @@ using Vortice.Mathematics;
 
 namespace BendWin.Core;
 
-// Owns the D3D11 device and renders the bend effect to an offscreen staging texture
-// that the overlay host reads back as BGRA bytes for display.
 public sealed class BendRenderer : IDisposable
 {
     public ID3D11Device Device { get; }
@@ -16,75 +15,65 @@ public sealed class BendRenderer : IDisposable
 
     private readonly FrameStore _store;
 
-    // Pipelines
     private ID3D11VertexShader? _vsMain;
     private ID3D11PixelShader?  _psGaussH;
     private ID3D11PixelShader?  _psGaussV;
     private ID3D11PixelShader?  _psBend;
 
-    // Constant buffers
     private ID3D11Buffer? _cbBend;
     private ID3D11Buffer? _cbBlur;
 
-    // Blur intermediate textures (original + 5 levels)
-    private ID3D11Texture2D?[]         _blurTextures  = new ID3D11Texture2D[7];
-    private ID3D11RenderTargetView?[]  _blurRTVs      = new ID3D11RenderTargetView[7];
-    private ID3D11ShaderResourceView?[] _blurSRVs     = new ID3D11ShaderResourceView[7];
+    // Index 0 = original; 1-5 = blur levels; 6 = horizontal-pass temp
+    private readonly ID3D11Texture2D?[]          _blurTex  = new ID3D11Texture2D[7];
+    private readonly ID3D11RenderTargetView?[]   _blurRTV  = new ID3D11RenderTargetView[7];
+    private readonly ID3D11ShaderResourceView?[] _blurSRV  = new ID3D11ShaderResourceView[7];
 
-    // Output staging texture (CPU-readable BGRA)
-    private ID3D11Texture2D?          _stagingTex;
     private ID3D11RenderTargetView?   _outputRTV;
-    private ID3D11ShaderResourceView? _outputSRV;
     private ID3D11Texture2D?          _readbackTex;
+    private ID3D11SamplerState?       _sampler;
+    private ID3D11RasterizerState?    _rasterState;
 
-    private ID3D11SamplerState?  _sampler;
-    private ID3D11RasterizerState? _rasterState;
-
-    private int _width, _height;
+    private int   _width, _height;
     private float _lastBlurParam = -1f;
-    private bool _disposed;
-    private long _lastFrameTimestamp;
+    private long  _lastFrameTs;
+    private bool  _disposed;
 
-    // Current render parameters (thread-safe write via Interlocked on floats isn't possible,
-    // so we use a simple struct copy under a lock).
     private BendParamsCpu _params;
     private readonly object _paramLock = new();
 
     [StructLayout(LayoutKind.Sequential, Pack = 16)]
     private struct BendParamsCpu
     {
-        public float Progress;
-        public float Perspective;
-        public float Blur;
-        public float Shadow;
-        public float Style;
+        public float Progress, Perspective, Blur, Shadow, Style;
         float _p0, _p1, _p2;
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 16)]
     private struct BlurParamsCpu
     {
-        public float TexelX;
-        public float TexelY;
-        public float Sigma;
+        public float TexelX, TexelY, Sigma;
         float _pad;
     }
 
     public BendRenderer(FrameStore store)
     {
         _store = store;
-        D3D11.D3D11CreateDevice(null, DriverType.Hardware, DeviceCreationFlags.None,
-            [FeatureLevel.Level_11_0, FeatureLevel.Level_10_1],
-            out var device, out var context);
-        Device  = device!;
-        Context = context!;
+        // Use explicit out types so the compiler picks the right overload
+        D3D11.D3D11CreateDevice(
+            adapter: null,
+            driverType: DriverType.Hardware,
+            flags: DeviceCreationFlags.None,
+            featureLevels: new[] { FeatureLevel.Level_11_0, FeatureLevel.Level_10_1 },
+            device: out ID3D11Device device,
+            immediateContext: out ID3D11DeviceContext context);
+        Device  = device;
+        Context = context;
     }
 
     public void Initialize(int width, int height)
     {
         _width  = width;
         _height = height;
-
         CompileShaders();
         CreateConstantBuffers();
         CreateBlurTextures(width, height);
@@ -105,82 +94,66 @@ public sealed class BendRenderer : IDisposable
         }
     }
 
-    // Returns a byte[] (BGRA, width×height×4) for the overlay to display,
-    // or null if no new frame is available.
     public byte[]? Draw()
     {
-        var (srcTex, ts) = _store.Get(_lastFrameTimestamp);
+        var (srcTex, ts) = _store.Get(_lastFrameTs);
         if (srcTex == null) return null;
-        _lastFrameTimestamp = ts;
+        _lastFrameTs = ts;
 
         BendParamsCpu p;
         lock (_paramLock) { p = _params; }
-
         if (p.Progress < 0.005f) return null;
 
-        // Create SRV for the source frame
         using var srcSRV = Device.CreateShaderResourceView(srcTex);
 
-        // Blur pass (only recompute if blur param changed significantly)
         bool needsBlur = Math.Abs(p.Blur - _lastBlurParam) > 0.01f;
-        if (needsBlur || _blurSRVs[0] == null)
+        if (needsBlur || _blurSRV[0] == null)
         {
             _lastBlurParam = p.Blur;
-            RunBlurPipeline(srcSRV, p.Blur);
+            RunBlurPipeline(srcTex, p.Blur);
         }
         else
         {
-            // Always refresh level 0 (original)
-            Context.CopyResource(_blurTextures[0]!, srcTex);
+            Context.CopyResource(_blurTex[0]!, srcTex);
         }
 
-        // Bend pass
         UpdateBendCB(p);
         RunBendPass();
-
         return ReadbackPixels();
     }
 
     // ── Blur pipeline ─────────────────────────────────────────────────────────
 
-    private void RunBlurPipeline(ID3D11ShaderResourceView srcSRV, float blurStrength)
+    private void RunBlurPipeline(ID3D11Texture2D srcTex, float blurStrength)
     {
-        // Level 0 = original
-        Context.CopyResource(_blurTextures[0]!, (ID3D11Resource)srcSRV.Resource!);
+        Context.CopyResource(_blurTex[0]!, srcTex);
 
-        // Levels 1-5 with increasing sigma
         float[] sigmas = [1f, 2f, 4f, 8f, 16f];
-
         for (int level = 0; level < 5; level++)
         {
             float sigma = sigmas[level] * (blurStrength * 1.5f + 0.5f);
-            int halfW = Math.Max(1, _width  >> (level / 2));
-            int halfH = Math.Max(1, _height >> (level / 2));
 
-            // --- Horizontal pass: levels[level] → levels[6] (temp) ---
             UpdateBlurCB(_width, _height, sigma, horizontal: true);
-            SetFullScreenPipeline(_psGaussH!, _blurRTVs[6]!, _blurSRVs[level]!, _width, _height);
+            SetupFullScreenPipeline(_psGaussH!, _blurRTV[6]!, _blurSRV[level]!, _width, _height);
             Context.Draw(3, 0);
 
-            // --- Vertical pass: levels[6] → levels[level+1] ---
             UpdateBlurCB(_width, _height, sigma, horizontal: false);
-            SetFullScreenPipeline(_psGaussV!, _blurRTVs[level + 1]!, _blurSRVs[6]!, _width, _height);
+            SetupFullScreenPipeline(_psGaussV!, _blurRTV[level + 1]!, _blurSRV[6]!, _width, _height);
             Context.Draw(3, 0);
         }
 
-        Context.PixelShaderSetShaderResources(0, null, null, null, null, null, null);
-        Context.OMSetRenderTargets(null, (ID3D11DepthStencilView?)null);
+        UnbindPipeline();
     }
 
-    private void SetFullScreenPipeline(ID3D11PixelShader ps, ID3D11RenderTargetView rtv,
+    private void SetupFullScreenPipeline(ID3D11PixelShader ps, ID3D11RenderTargetView rtv,
         ID3D11ShaderResourceView srv, int w, int h)
     {
         Context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         Context.VSSetShader(_vsMain);
         Context.PSSetShader(ps);
-        Context.PSSetShaderResources(0, srv);
-        Context.PSSetSamplers(0, _sampler);
-        Context.PSSetConstantBuffers(0, _cbBlur);
+        Context.PSSetShaderResources(0, new[] { srv });
+        Context.PSSetSamplers(0, new[] { _sampler! });
+        Context.PSSetConstantBuffers(0, new[] { _cbBlur! });
         Context.OMSetRenderTargets(rtv);
         Context.RSSetViewport(new Viewport(0, 0, w, h));
         Context.RSSetState(_rasterState);
@@ -191,32 +164,35 @@ public sealed class BendRenderer : IDisposable
         Context.IASetPrimitiveTopology(PrimitiveTopology.TriangleList);
         Context.VSSetShader(_vsMain);
         Context.PSSetShader(_psBend);
-        Context.PSSetShaderResources(0,
-            _blurSRVs[0], _blurSRVs[1], _blurSRVs[2],
-            _blurSRVs[3], _blurSRVs[4], _blurSRVs[5]);
-        Context.PSSetSamplers(0, _sampler);
-        Context.PSSetConstantBuffers(0, _cbBend);
-        Context.OMSetRenderTargets(_outputRTV);
+        Context.PSSetShaderResources(0, new[]
+        {
+            _blurSRV[0]!, _blurSRV[1]!, _blurSRV[2]!,
+            _blurSRV[3]!, _blurSRV[4]!, _blurSRV[5]!
+        });
+        Context.PSSetSamplers(0, new[] { _sampler! });
+        Context.PSSetConstantBuffers(0, new[] { _cbBend! });
+        Context.OMSetRenderTargets(_outputRTV!);
         Context.RSSetViewport(new Viewport(0, 0, _width, _height));
         Context.RSSetState(_rasterState);
         Context.Draw(3, 0);
-        Context.PixelShaderSetShaderResources(0, null, null, null, null, null, null);
-        Context.OMSetRenderTargets(null, (ID3D11DepthStencilView?)null);
+        UnbindPipeline();
     }
 
-    private byte[] ReadbackPixels()
+    private void UnbindPipeline()
     {
-        if (_readbackTex == null) return [];
-        Context.CopyResource(_readbackTex, (ID3D11Resource)_outputRTV!.Resource!);
-        var mapped = Context.Map(_readbackTex, 0, MapMode.Read, MapFlags.None);
-        int bytes = _height * _width * 4;
-        var buf = new byte[bytes];
-        unsafe
-        {
-            for (int row = 0; row < _height; row++)
-                Marshal.Copy(mapped.DataPointer + row * mapped.RowPitch, buf, row * _width * 4, _width * 4);
-        }
-        Context.Unmap(_readbackTex, 0);
+        Context.PSSetShaderResources(0, new ID3D11ShaderResourceView?[6]);
+        Context.OMSetRenderTargets(Array.Empty<ID3D11RenderTargetView>());
+    }
+
+    private unsafe byte[] ReadbackPixels()
+    {
+        Context.CopyResource(_readbackTex!, (ID3D11Resource)_outputRTV!.Resource!);
+        var mapped = Context.Map(_readbackTex!, 0, MapMode.Read, D3D11MapFlags.None);
+        int stride = _width * 4;
+        var buf = new byte[_height * stride];
+        for (int row = 0; row < _height; row++)
+            Marshal.Copy(mapped.DataPointer + row * mapped.RowPitch, buf, row * stride, stride);
+        Context.Unmap(_readbackTex!, 0);
         return buf;
     }
 
@@ -224,29 +200,46 @@ public sealed class BendRenderer : IDisposable
 
     private void CompileShaders()
     {
-        string shaderDir = Path.Combine(AppContext.BaseDirectory, "Shaders");
-        _vsMain  = CompileVS(Path.Combine(shaderDir, "BendVertex.hlsl"));
-        _psGaussH = CompilePS(Path.Combine(shaderDir, "GaussianH.hlsl"));
-        _psGaussV = CompilePS(Path.Combine(shaderDir, "GaussianV.hlsl"));
-        _psBend  = CompilePS(Path.Combine(shaderDir, "BendPixel.hlsl"));
+        string dir = Path.Combine(AppContext.BaseDirectory, "Shaders");
+        _vsMain   = CompileVS(Path.Combine(dir, "BendVertex.hlsl"));
+        _psGaussH = CompilePS(Path.Combine(dir, "GaussianH.hlsl"));
+        _psGaussV = CompilePS(Path.Combine(dir, "GaussianV.hlsl"));
+        _psBend   = CompilePS(Path.Combine(dir, "BendPixel.hlsl"));
     }
 
-    private ID3D11VertexShader CompileVS(string path)
+    private unsafe ID3D11VertexShader CompileVS(string path)
     {
-        var src = File.ReadAllText(path);
-        Compiler.Compile(src, null, null, "main", Path.GetFileName(path), "vs_5_0", 0, 0,
-            out var blob, out var err);
-        if (blob == null) throw new Exception($"VS compile error: {err?.ConvertToString()}");
-        return Device.CreateVertexShader(blob.GetBytes());
+        Compiler.Compile(File.ReadAllText(path), null, null, "main",
+            Path.GetFileName(path), "vs_5_0", 0, 0, out var blob, out var err);
+        if (blob == null)
+            throw new Exception($"VS compile '{path}': {BlobString(err)}");
+        return Device.CreateVertexShader(BlobBytes(blob));
     }
 
-    private ID3D11PixelShader CompilePS(string path)
+    private unsafe ID3D11PixelShader CompilePS(string path)
     {
-        var src = File.ReadAllText(path);
-        Compiler.Compile(src, null, null, "main", Path.GetFileName(path), "ps_5_0", 0, 0,
-            out var blob, out var err);
-        if (blob == null) throw new Exception($"PS compile error: {err?.ConvertToString()}");
-        return Device.CreatePixelShader(blob.GetBytes());
+        Compiler.Compile(File.ReadAllText(path), null, null, "main",
+            Path.GetFileName(path), "ps_5_0", 0, 0, out var blob, out var err);
+        if (blob == null)
+            throw new Exception($"PS compile '{path}': {BlobString(err)}");
+        return Device.CreatePixelShader(BlobBytes(blob));
+    }
+
+    private static unsafe byte[] BlobBytes(Vortice.D3DCompiler.Blob blob)
+    {
+        var size = (int)blob.BufferSize;
+        var buf  = new byte[size];
+        Marshal.Copy(blob.BufferPointer, buf, 0, size);
+        return buf;
+    }
+
+    private static unsafe string BlobString(Vortice.D3DCompiler.Blob? blob)
+    {
+        if (blob == null) return "(no error blob)";
+        var size = (int)blob.BufferSize;
+        var buf  = new byte[size];
+        Marshal.Copy(blob.BufferPointer, buf, 0, size);
+        return Encoding.UTF8.GetString(buf);
     }
 
     private void CreateConstantBuffers()
@@ -267,12 +260,11 @@ public sealed class BendRenderer : IDisposable
             Usage = ResourceUsage.Default,
             BindFlags = BindFlags.ShaderResource | BindFlags.RenderTarget,
         };
-
         for (int i = 0; i < 7; i++)
         {
-            _blurTextures[i] = Device.CreateTexture2D(desc);
-            _blurRTVs[i]     = Device.CreateRenderTargetView(_blurTextures[i]!);
-            _blurSRVs[i]     = Device.CreateShaderResourceView(_blurTextures[i]!);
+            _blurTex[i] = Device.CreateTexture2D(desc);
+            _blurRTV[i] = Device.CreateRenderTargetView(_blurTex[i]!);
+            _blurSRV[i] = Device.CreateShaderResourceView(_blurTex[i]!);
         }
     }
 
@@ -288,16 +280,13 @@ public sealed class BendRenderer : IDisposable
         };
         var outTex = Device.CreateTexture2D(desc);
         _outputRTV = Device.CreateRenderTargetView(outTex);
-        _outputSRV = Device.CreateShaderResourceView(outTex);
 
-        // CPU-readable staging texture
-        var staging = desc with
+        _readbackTex = Device.CreateTexture2D(desc with
         {
             Usage = ResourceUsage.Staging,
             BindFlags = BindFlags.None,
             CPUAccessFlags = CpuAccessFlags.Read,
-        };
-        _readbackTex = Device.CreateTexture2D(staging);
+        });
     }
 
     private void CreateSampler()
@@ -324,8 +313,8 @@ public sealed class BendRenderer : IDisposable
 
     private void UpdateBendCB(BendParamsCpu p)
     {
-        var mapped = Context.Map(_cbBend!, 0, MapMode.WriteDiscard, MapFlags.None);
-        unsafe { Marshal.StructureToPtr(p, mapped.DataPointer, false); }
+        var m = Context.Map(_cbBend!, 0, MapMode.WriteDiscard, D3D11MapFlags.None);
+        Marshal.StructureToPtr(p, m.DataPointer, false);
         Context.Unmap(_cbBend!, 0);
     }
 
@@ -337,8 +326,8 @@ public sealed class BendRenderer : IDisposable
             TexelY = horizontal ? 0f : 1f / h,
             Sigma  = sigma,
         };
-        var mapped = Context.Map(_cbBlur!, 0, MapMode.WriteDiscard, MapFlags.None);
-        unsafe { Marshal.StructureToPtr(cp, mapped.DataPointer, false); }
+        var m = Context.Map(_cbBlur!, 0, MapMode.WriteDiscard, D3D11MapFlags.None);
+        Marshal.StructureToPtr(cp, m.DataPointer, false);
         Context.Unmap(_cbBlur!, 0);
     }
 
@@ -346,10 +335,8 @@ public sealed class BendRenderer : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
-        foreach (var t in _blurTextures) t?.Dispose();
-        foreach (var v in _blurRTVs)    v?.Dispose();
-        foreach (var v in _blurSRVs)    v?.Dispose();
-        _outputRTV?.Dispose(); _outputSRV?.Dispose(); _readbackTex?.Dispose();
+        for (int i = 0; i < 7; i++) { _blurTex[i]?.Dispose(); _blurRTV[i]?.Dispose(); _blurSRV[i]?.Dispose(); }
+        _outputRTV?.Dispose(); _readbackTex?.Dispose();
         _vsMain?.Dispose(); _psGaussH?.Dispose(); _psGaussV?.Dispose(); _psBend?.Dispose();
         _cbBend?.Dispose(); _cbBlur?.Dispose();
         _sampler?.Dispose(); _rasterState?.Dispose();

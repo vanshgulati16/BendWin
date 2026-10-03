@@ -73,10 +73,13 @@ public sealed class DesktopCapture : IDisposable
 
         try
         {
-            // Get the underlying D3D11 texture from the WinRT surface
-            var access = (IDirect3DDxgiInterfaceAccess)frame.Surface;
+            // Unwrap WinRT surface → D3D11 texture via IDxgiInterfaceAccess
+            var surfacePtr = Marshal.GetIUnknownForObject(frame.Surface);
+            var access = (IDxgiInterfaceAccess)Marshal.GetObjectForIUnknown(surfacePtr);
+            Marshal.Release(surfacePtr);
             Guid tex2dGuid = typeof(ID3D11Texture2D).GUID;
-            using var srcTexture = (ID3D11Texture2D)access.GetInterface(tex2dGuid);
+            access.GetInterface(ref tex2dGuid, out var texPtr);
+            using var srcTexture = new ID3D11Texture2D(texPtr);
 
             var desc = srcTexture.Description;
             desc.BindFlags = BindFlags.ShaderResource;
@@ -110,6 +113,15 @@ public sealed class DesktopCapture : IDisposable
 
     // IID for Windows.Graphics.Capture.IGraphicsCaptureItem
     private static readonly Guid IID_IGraphicsCaptureItem = new("79C3F95B-31F7-4EC2-A464-632EF5D30760");
+
+    // IDirect3DDxgiInterfaceAccess — lets us unwrap the WinRT surface to a D3D11 texture
+    [ComImport]
+    [Guid("A9B3D012-3DF2-4EE3-B8D1-8695F457D3C1")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IDxgiInterfaceAccess
+    {
+        [PreserveSig] int GetInterface(ref Guid iid, out IntPtr ppv);
+    }
 
     [ComImport]
     [Guid("3628E81B-3CAC-4C60-B7F4-23CE0E0C3356")]

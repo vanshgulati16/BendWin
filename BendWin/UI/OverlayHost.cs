@@ -4,6 +4,9 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using BendWin.Core;
 using BendWin.Native;
+using Brushes = System.Windows.Media.Brushes;
+using HorizontalAlignment = System.Windows.HorizontalAlignment;
+using VerticalAlignment = System.Windows.VerticalAlignment;
 
 namespace BendWin.UI;
 

@@ -91,7 +91,10 @@ public sealed class DesktopCapture : IDisposable
 
             _store.Set(copy, DateTime.UtcNow.Ticks);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[BendWin] FrameArrived error: {ex}");
+        }
     }
 
     // ── WinRT interop ─────────────────────────────────────────────────────────

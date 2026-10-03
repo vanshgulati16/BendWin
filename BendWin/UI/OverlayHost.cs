@@ -73,7 +73,6 @@ internal sealed class OverlayWindow : Window
 
     private void OnLoaded(object sender, RoutedEventArgs e)
     {
-        // Register for lid power events and Escape hotkey via the window HWND
         _hwndSource = System.Windows.Interop.HwndSource.FromHwnd(
             new System.Windows.Interop.WindowInteropHelper(this).Handle);
         _hwndSource.AddHook(WndProc);
@@ -86,11 +85,34 @@ internal sealed class OverlayWindow : Window
 
         PowerNative.RegisterHotKey(hwnd, PowerNative.HOTKEY_ID_PAUSE, 0, PowerNative.VK_ESCAPE);
 
-        // Start capture and render
-        _capture.Start();
+        try
+        {
+            _capture.Start();
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(
+                $"Screen capture failed to start:\n\n{ex.GetType().Name}: {ex.Message}\n\n{ex.StackTrace}",
+                "BendWin — Capture Error", System.Windows.MessageBoxButton.OK,
+                System.Windows.MessageBoxImage.Error);
+            return; // timer won't start; overlay stays hidden but app keeps running
+        }
+
         int w = _capture.CaptureSize.Width;
         int h = _capture.CaptureSize.Height;
-        _renderer.Initialize(w, h);
+
+        try
+        {
+            _renderer.Initialize(w, h);
+        }
+        catch (Exception ex)
+        {
+            System.Windows.MessageBox.Show(
+                $"Renderer failed to initialize:\n\n{ex.GetType().Name}: {ex.Message}\n\n{ex.StackTrace}",
+                "BendWin — Renderer Error", System.Windows.MessageBoxButton.OK,
+                System.Windows.MessageBoxImage.Error);
+            return;
+        }
 
         _bitmap = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
         ((System.Windows.Controls.Image)Content!).Source = _bitmap;
